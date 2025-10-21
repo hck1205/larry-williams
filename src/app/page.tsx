@@ -1,161 +1,167 @@
+// src/app/page.tsx
 "use client";
 
-import { useEffect } from "react";
-
-// 차트/섹션 컴포넌트
-import Chart from "@/components/Chart";
-import IndicatorCards from "@/components/IndicatorCards";
-import CotSection from "@/components/CotSection";
-
-// 훅
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { usePrice } from "@/hooks/usePrice";
-import { useCot } from "@/hooks/useCot";
 import { useIndicators } from "@/hooks/useIndicators";
+import { useCot } from "@/hooks/useCot";
+import PriceChart from "@/components/Chart";
+import CotSection from "@/components/CotSection";
+import IndicatorCards from "@/components/IndicatorCards";
+
+const TICKER_PRESETS = ["NVDA", "AAPL", "SPY"] as const;
 
 export default function Page() {
-  // ── 가격 훅
-  const {
-    ticker,
-    setTicker,
-    bars,
-    state: priceState,
-    error: priceErr,
-    load: loadPrice,
-  } = usePrice("NVDA");
+  const [input, setInput] = useState("NVDA");
 
-  console.log("bars", bars);
+  // 가격(=FMP EOD); 훅 내부에서 ticker를 upper로 관리
+  const { ticker, bars, state, error, load } = usePrice("NVDA");
+  const { wr, uo, breakout } = useIndicators(bars);
 
-  // ── COT 훅 (초기 NQ)
-  const {
-    from,
-    to,
-    symbol: cotSymbol,
-    setSymbol: setCotSymbol,
-    state: cotState,
-    error: cotErr,
-    series: cotSeries,
-    summary: cotSummary,
-    load: loadCot,
-  } = useCot({ initialSymbol: "NQ" });
+  // COT (CFTC) — NQ 기본
+  const { symbol, seriesGroups, cotState, cotError, loadCot } = useCot("NQ");
 
-  // ── 지표 훅 (bars → %R/UO/돌파 + 매수 힌트)
-  const { latestWR, latestUO, latestBO, buyHint } = useIndicators(bars);
-
-  // 초기 로드
+  // 최초 로드
   useEffect(() => {
-    void loadPrice(ticker);
-    void loadCot(cotSymbol ? { symbol: cotSymbol, from, to } : undefined);
+    load(); // Price
+    loadCot(); // COT
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 폼 제출 핸들러
-  const onFetch = (e: React.FormEvent) => {
-    e.preventDefault();
-    void loadPrice(ticker);
-    // 필요 시 COT 심볼도 함께 변경하도록 UI 확장 가능
+  const onSearch = useCallback(async () => {
+    const sym = (input || "").trim().toUpperCase();
+    if (!sym) return;
+    await load(sym);
+  }, [input, load]);
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") onSearch();
   };
 
+  const hasBars = useMemo(() => (bars?.length ?? 0) > 0, [bars]);
+
   return (
-    <main
-      style={{
-        maxWidth: 1080,
-        margin: "40px auto",
-        padding: 16,
-        fontFamily: "system-ui",
-      }}
-    >
-      <h1 style={{ marginBottom: 8 }}>Larry Williams Dashboard</h1>
-      <p style={{ opacity: 0.8, marginTop: 0 }}>
-        가격/지표는 티커 기준, COT은 선물 심볼(예: NQ) 기준입니다.
-      </p>
+    <main style={{ padding: 20, maxWidth: 1200, margin: "0 auto" }}>
+      <h1 style={{ margin: "8px 0 16px" }}>Larry Williams Dashboard</h1>
 
-      {/* 가격 티커 입력 */}
-      <form
-        onSubmit={onFetch}
-        style={{ display: "flex", gap: 8, margin: "12px 0 16px" }}
+      {/* 검색 바 + 상태 */}
+      <div
+        style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}
       >
         <input
-          value={ticker}
-          onChange={(e) => setTicker(e.target.value)}
-          placeholder="NVDA"
-          aria-label="Ticker"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={onKeyDown}
+          placeholder="Ticker (예: NVDA, AAPL)"
           style={{
-            border: "1px solid #ddd",
+            padding: 8,
             borderRadius: 8,
-            padding: "10px 12px",
-            width: 200,
+            border: "1px solid #333",
+            flex: "0 0 220px",
+            background: "#0f1218",
+            color: "#e6e6e6",
           }}
         />
         <button
-          style={{
-            padding: "10px 16px",
-            borderRadius: 8,
-            border: "1px solid #222",
-            background: "#111",
-            color: "white",
-          }}
-        >
-          {priceState === "loading" ? "Loading…" : "Fetch"}
-        </button>
-      </form>
-
-      {/* 가격 차트 */}
-      {priceErr && (
-        <div style={{ color: "crimson", marginBottom: 8 }}>
-          Price Error: {priceErr}
-        </div>
-      )}
-      {bars.length > 0 && <Chart bars={bars} />}
-
-      {/* 지표 카드 */}
-      {bars.length > 0 && (
-        <IndicatorCards
-          latestWR={Number.isFinite(latestWR) ? (latestWR as number) : "N/A"}
-          latestUO={Number.isFinite(latestUO) ? (latestUO as number) : "N/A"}
-          latestBO={typeof latestBO === "boolean" ? latestBO : false}
-          buyHint={buyHint}
-        />
-      )}
-
-      {/* COT 심볼 빠른 변경 (선택) */}
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          void loadCot({ symbol: cotSymbol, from, to });
-        }}
-        style={{ display: "flex", gap: 8, margin: "20px 0 8px" }}
-      >
-        <input
-          value={cotSymbol}
-          onChange={(e) => setCotSymbol(e.target.value.toUpperCase())}
-          placeholder="NQ"
-          aria-label="COT Symbol"
-          style={{
-            border: "1px solid #ddd",
-            borderRadius: 8,
-            padding: "8px 10px",
-            width: 140,
-          }}
-        />
-        <button
+          onClick={onSearch}
+          disabled={state === "loading"}
           style={{
             padding: "8px 12px",
             borderRadius: 8,
-            border: "1px solid #222",
-            background: "#111",
-            color: "white",
+            border: "1px solid #444",
+            background: "#1b1f2a",
+            color: "#fff",
+            cursor: state === "loading" ? "not-allowed" : "pointer",
+            opacity: state === "loading" ? 0.6 : 1,
           }}
+          title="Load price data"
         >
-          {cotState === "loading" ? "Loading…" : "Load COT"}
+          {state === "loading" ? "Loading…" : "Load"}
         </button>
-      </form>
+
+        {/* 프리셋 */}
+        <div style={{ display: "flex", gap: 6 }}>
+          {TICKER_PRESETS.map((t) => (
+            <button
+              key={t}
+              onClick={() => {
+                setInput(t);
+                load(t);
+              }}
+              disabled={state === "loading"}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 8,
+                border: "1px solid #444",
+                background: ticker === t ? "#182235" : "#1b1f2a",
+                color: "#fff",
+                cursor: state === "loading" ? "not-allowed" : "pointer",
+                opacity: state === "loading" ? 0.6 : 1,
+              }}
+              title={`Load ${t}`}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+
+        {/* 상태/오류 표시 */}
+        <span style={{ opacity: 0.8, alignSelf: "center" }}>
+          {state === "loading"
+            ? "로딩 중…"
+            : state === "error"
+            ? `에러: ${error}`
+            : hasBars
+            ? ticker
+            : "데이터 없음"}
+        </span>
+      </div>
+
+      {/* 지표 카드 */}
+      <IndicatorCards bars={bars} wr={wr} uo={uo} breakout={breakout} />
+
+      {/* 가격 차트 */}
+      <section
+        style={{
+          marginTop: 20,
+          background: "#12141b",
+          borderRadius: 12,
+          padding: 12,
+        }}
+      >
+        <h2 style={{ margin: "4px 0 12px" }}>{ticker} — Price</h2>
+        {hasBars ? (
+          <PriceChart bars={bars} wr={wr} uo={uo} />
+        ) : (
+          <div
+            style={{
+              height: 440,
+              borderRadius: 12,
+              background: "#14161e",
+              border: "1px dashed #2b3140",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: "#9aa3b2",
+              fontSize: 13,
+            }}
+          >
+            No price data
+          </div>
+        )}
+      </section>
 
       {/* COT 섹션 */}
       <CotSection
-        title="COT (Commercial Net Position)"
-        series={cotSeries}
-        summary={cotSummary}
-        error={cotErr}
+        symbol={symbol}
+        setSymbol={() => {
+          /* 내부에서 직접 관리하지 않음: loadCot 사용 */
+        }}
+        seriesGroups={seriesGroups}
+        state={cotState}
+        error={cotError}
+        onReload={() => loadCot(symbol)}
+        onChangeSymbol={(s) => loadCot(s)}
       />
     </main>
   );

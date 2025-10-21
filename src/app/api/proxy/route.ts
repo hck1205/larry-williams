@@ -1,114 +1,226 @@
 // src/app/api/proxy/route.ts
+import { CFTC_MARKET_MAP } from "@/lib/cot";
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "edge";
-// 상단에 상수
+
 const CFTC_HOST = "https://publicreportinghub.cftc.gov";
 const DATASET_TFF_FUTURES_ONLY = "gpe5-46if"; // Traders in Financial Futures - Futures Only
 
-// 선택: 축약코드 → 정식 마켓명 매핑 (필요 시 확장)
-const MARKET_MAP: Record<string, string> = {
-  NQ: "NASDAQ-100 Consolidated",
-  ES: "S&P 500 Consolidated",
-  YM: "DJIA Consolidated",
-  RTY: "Russell 2000 Consolidated",
+/* ─────────────────────────────────────────────
+ * Small helpers (중복 제거)
+ * ────────────────────────────────────────────*/
+const getEnv = (key: string) => {
+  const v = (process.env as Record<string, string | undefined>)[key] ?? "";
+  return v;
 };
 
-// ─────────────────────────────────────────────
-// 허용 소스(화이트리스트)
-// ─────────────────────────────────────────────
+const tokenHostForFinnhub = (token: string) =>
+  token?.startsWith("sandbox_")
+    ? "https://sandbox.finnhub.io"
+    : "https://finnhub.io";
+
+const buildFmpUrl = (
+  path: string,
+  params: Record<string, string | undefined>
+) => {
+  const apikey = getEnv("FMP_API_KEY");
+  if (!apikey) throw new Error("Missing FMP_API_KEY");
+  const url = new URL(`https://financialmodelingprep.com${path}`);
+  for (const [k, v] of Object.entries(params)) {
+    if (v != null && v !== "") url.searchParams.set(k, v);
+  }
+  url.searchParams.set("apikey", apikey);
+  return url.toString();
+};
+
+/* ─────────────────────────────────────────────
+ * White-list (ALLOW_SOURCES)
+ * ────────────────────────────────────────────*/
 const ALLOW_SOURCES = {
-  // 가격 데이터 (무료 엔드포인트 권장)
-  alpha: {
-    host: "https://www.alphavantage.co",
+  /* ──────────────────────────────────────────
+   * ✅ Finnhub Candle (유료 플랜 필요; sandbox 자동 전환)
+   * ─────────────────────────────────────────*/
+  finnhub_candle: {
+    host: "https://finnhub.io",
     buildUrl: (sp: URLSearchParams) => {
-      const symbol = (sp.get("symbol") || "AAPL").toUpperCase();
-      const fn = sp.get("function") || "TIME_SERIES_DAILY"; // DAILY_ADJUSTED는 프리미엄일 수 있음
-      const apikey = process.env.ALPHAVANTAGE_API_KEY;
-      if (!apikey) throw new Error("Missing ALPHAVANTAGE_API_KEY");
-      return `https://www.alphavantage.co/query?function=${encodeURIComponent(
-        fn
-      )}&symbol=${encodeURIComponent(
-        symbol
-      )}&datatype=json&outputsize=compact&apikey=${apikey}`;
+      const symbol = (sp.get("symbol") || "NVDA").toUpperCase();
+      const resolution = sp.get("resolution") || "D"; // 1,5,15,30,60,D,W,M
+      const from =
+        sp.get("from") ||
+        Math.floor(Date.now() / 1000 - 400 * 86400).toString();
+      const to = sp.get("to") || Math.floor(Date.now() / 1000).toString();
+
+      const token = getEnv("FINNHUB_API_KEY");
+      if (!token) throw new Error("Missing FINNHUB_API_KEY");
+
+      const host = tokenHostForFinnhub(token);
+      // 실제 캔들 엔드포인트 (403 가능)
+      const url = new URL(`${host}/api/v1/stock/candle`);
+      url.searchParams.set("symbol", symbol);
+      url.searchParams.set("resolution", resolution);
+      url.searchParams.set("from", from);
+      url.searchParams.set("to", to);
+      url.searchParams.set("token", token);
+      return url.toString();
     },
-    cacheControl: "public, s-maxage=30", // 단기 캐시
+    cacheControl: "public, s-maxage=60, stale-while-revalidate=300",
     contentTypeFallback: "application/json; charset=utf-8",
   },
 
-  // ✅ COT 데이터 (FMP COT Analysis)
+  /* ──────────────────────────────────────────
+   * ✅ Finnhub Quote (현재가/당일 데이터)
+   * ─────────────────────────────────────────*/
+  finnhub_quote: {
+    host: "https://finnhub.io",
+    buildUrl: (sp: URLSearchParams) => {
+      const symbol = (sp.get("symbol") || "NVDA").toUpperCase();
+      const token = getEnv("FINNHUB_API_KEY");
+      if (!token) throw new Error("Missing FINNHUB_API_KEY");
+      const host = tokenHostForFinnhub(token);
+      const url = new URL(`${host}/api/v1/quote`);
+      url.searchParams.set("symbol", symbol);
+      url.searchParams.set("token", token);
+      return url.toString();
+    },
+    cacheControl: "no-store",
+    contentTypeFallback: "application/json; charset=utf-8",
+  },
+
+  /* ──────────────────────────────────────────
+   * ✅ FMP EOD (Stable) — 일봉 OHLC
+   * ─────────────────────────────────────────*/
+  fmp_eod: {
+    host: "https://financialmodelingprep.com",
+    buildUrl: (sp: URLSearchParams) => {
+      const symbol = (sp.get("symbol") || "NVDA").toUpperCase();
+      const from = sp.get("from") || ""; // YYYY-MM-DD (선택)
+      const to = sp.get("to") || ""; // YYYY-MM-DD (선택)
+      // 일부 계정에서 from/to 미지원일 수 있음 → 없어도 호출되게 유지
+      return buildFmpUrl("/stable/historical-price-eod/full", {
+        symbol,
+        ...(from ? { from } : {}),
+        ...(to ? { to } : {}),
+      });
+    },
+    cacheControl: "public, s-maxage=600, stale-while-revalidate=604800",
+    contentTypeFallback: "application/json; charset=utf-8",
+  },
+
+  /* ──────────────────────────────────────────
+   * ✅ FMP COT (Stable 분석) — alias: fmp_cot
+   * ─────────────────────────────────────────*/
   fmp_cot: {
     host: "https://financialmodelingprep.com",
     buildUrl: (sp: URLSearchParams) => {
-      const from = sp.get("from") || "2024-01-01";
-      const to = sp.get("to") || new Date().toISOString().slice(0, 10);
-      const symbol = sp.get("symbol"); // 선택: 특정 심볼(계약) 필터
-      const apikey = process.env.FMP_API_KEY;
-      if (!apikey) throw new Error("Missing FMP_API_KEY");
-
-      // 기본: 기간 분석 엔드포인트
-      const base = `https://financialmodelingprep.com/api/v4/commitment_of_traders_report_analysis?from=${encodeURIComponent(
-        from
-      )}&to=${encodeURIComponent(to)}&apikey=${apikey}`;
-
-      // ✅ 수정된 부분
-      // symbol이 있을 경우 "analysis/{symbol}" 경로 사용
-      if (symbol) {
-        return `https://financialmodelingprep.com/api/v4/commitment_of_traders_report_analysis/${encodeURIComponent(
-          symbol
-        )}?from=${encodeURIComponent(from)}&to=${encodeURIComponent(
-          to
-        )}&apikey=${apikey}`;
-      }
-
-      return base;
+      const symbol = sp.get("symbol") || ""; // 선택
+      const from = sp.get("from") || ""; // YYYY-MM-DD (선택)
+      const to = sp.get("to") || ""; // YYYY-MM-DD (선택)
+      return buildFmpUrl("/stable/commitment-of-traders-analysis", {
+        ...(symbol ? { symbol } : {}),
+        ...(from ? { from } : {}),
+        ...(to ? { to } : {}),
+      });
     },
     cacheControl: "public, s-maxage=86400, stale-while-revalidate=604800",
     contentTypeFallback: "application/json; charset=utf-8",
   },
-  // ─────────────────────────────────────────────
-  // ✅ CFTC PRE (TFF Futures-Only) — Socrata JSON
-  // ─────────────────────────────────────────────
+
+  /* ──────────────────────────────────────────
+   * ✅ FMP COT (Stable 기본 리포트)
+   * ─────────────────────────────────────────*/
+  fmp_cot_report: {
+    host: "https://financialmodelingprep.com",
+    buildUrl: (_sp: URLSearchParams) => {
+      return buildFmpUrl("/stable/commitment-of-traders-report", {});
+    },
+    cacheControl: "public, s-maxage=86400, stale-while-revalidate=604800",
+    contentTypeFallback: "application/json; charset=utf-8",
+  },
+
+  /* ──────────────────────────────────────────
+   * ✅ CFTC PRE (TFF Futures Only) — Socrata JSON
+   * ─────────────────────────────────────────*/
+  // src/app/api/proxy/route.ts (cftc_pre_tff만 교체)
   cftc_pre_tff: {
     host: CFTC_HOST,
     buildUrl: (sp: URLSearchParams) => {
       const from = sp.get("from") || "2024-01-01";
       const to = sp.get("to") || new Date().toISOString().slice(0, 10);
 
-      // 사용자가 NQ/ES 같이 보냈을 때 정식 이름으로 매핑
+      // 입력값(축약 포함)을 정식명으로 매핑
       const raw = sp.get("market") || "NASDAQ-100 Consolidated";
-      const market = MARKET_MAP[raw.toUpperCase()] ?? raw;
+      const market = CFTC_MARKET_MAP[raw.toUpperCase()] ?? raw;
 
-      const where = encodeURIComponent(
-        `report_date_as_yyyy_mm_dd between '${from}' and '${to}' AND market_and_exchange_names = '${market}'`
-      );
-      const url =
+      // Socrata where: 대소문자 무시 + 접두사 매칭
+      const escape = (s: string) => s.replaceAll("'", "''");
+      const whereParts = [
+        `report_date_as_yyyy_mm_dd between '${from}' and '${to}'`,
+        `upper(market_and_exchange_names) like upper('${escape(market)}%')`,
+      ];
+      const where = encodeURIComponent(whereParts.join(" AND "));
+
+      return (
         `${CFTC_HOST}/resource/${DATASET_TFF_FUTURES_ONLY}.json` +
-        `?$where=${where}&$order=report_date_as_yyyy_mm_dd&$limit=50000`;
-
-      return url;
+        `?$where=${where}&$order=report_date_as_yyyy_mm_dd&$limit=50000`
+      );
+    },
+    cacheControl: "public, s-maxage=86400, stale-while-revalidate=604800",
+    contentTypeFallback: "application/json; charset=utf-8",
+  },
+  // ALLOW_SOURCES에 추가: cftc_markets (기간 내 distinct market 나열)
+  cftc_markets: {
+    host: CFTC_HOST,
+    buildUrl: (sp: URLSearchParams) => {
+      const from = sp.get("from") || "2024-01-01";
+      const to = sp.get("to") || new Date().toISOString().slice(0, 10);
+      const where = encodeURIComponent(
+        `report_date_as_yyyy_mm_dd between '${from}' and '${to}'`
+      );
+      // distinct + 카운트
+      const select = encodeURIComponent(
+        "market_and_exchange_names, count(1) as n"
+      );
+      const group = encodeURIComponent("market_and_exchange_names");
+      const order = encodeURIComponent("n DESC");
+      return (
+        `${CFTC_HOST}/resource/${DATASET_TFF_FUTURES_ONLY}.json` +
+        `?$select=${select}&$where=${where}&$group=${group}&$order=${order}&$limit=2000`
+      );
     },
     cacheControl: "public, s-maxage=86400, stale-while-revalidate=604800",
     contentTypeFallback: "application/json; charset=utf-8",
   },
 } as const;
 
-// ─────────────────────────────────────────────
-// GET 핸들러
-// ─────────────────────────────────────────────
+/* ─────────────────────────────────────────────
+ * OPTIONS (CORS preflight)
+ * ────────────────────────────────────────────*/
+export async function OPTIONS(req: NextRequest) {
+  const res = new NextResponse(null, { status: 204 });
+  res.headers.set(
+    "access-control-allow-origin",
+    req.headers.get("origin") || "*"
+  );
+  res.headers.set("access-control-allow-headers", "content-type");
+  res.headers.set("access-control-allow-methods", "GET,OPTIONS");
+  res.headers.set("access-control-max-age", "86400");
+  return res;
+}
+
+/* ─────────────────────────────────────────────
+ * GET handler
+ * ────────────────────────────────────────────*/
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
     const src = (searchParams.get("src") ||
-      "alpha") as keyof typeof ALLOW_SOURCES;
-
+      "finnhub_quote") as keyof typeof ALLOW_SOURCES;
     if (!(src in ALLOW_SOURCES)) {
       return NextResponse.json({ error: "src not allowed" }, { status: 400 });
     }
 
     const targetUrl = ALLOW_SOURCES[src].buildUrl(searchParams);
-
-    // 민감 헤더 제거 & 외부 호출
     const upstream = await fetch(targetUrl, {
       headers: {
         "user-agent": "lw-dashboard/edge",
@@ -117,24 +229,26 @@ export async function GET(req: NextRequest) {
       cache: "no-store",
     });
 
-    const body = await upstream.text();
-    const res = new NextResponse(body, {
+    const bodyText = await upstream.text();
+
+    // 업스트림 응답/에러를 그대로 패스스루 + 디버그 헤더
+    const res = new NextResponse(bodyText, {
       status: upstream.status,
       headers: {
         "content-type":
           upstream.headers.get("content-type") ||
           ALLOW_SOURCES[src].contentTypeFallback,
         "cache-control": ALLOW_SOURCES[src].cacheControl,
+        "x-debug-upstream-host": new URL(targetUrl).host,
+        "x-debug-upstream-status": String(upstream.status),
       },
     });
 
-    // CORS — 필요 시 특정 오리진만 허용하세요.
     res.headers.set(
       "access-control-allow-origin",
       req.headers.get("origin") || "*"
     );
     res.headers.set("access-control-allow-headers", "content-type");
-
     return res;
   } catch (err: unknown) {
     return NextResponse.json(
